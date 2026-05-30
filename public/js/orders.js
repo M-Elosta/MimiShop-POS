@@ -60,6 +60,7 @@ async function renderOrders() {
 
     ${orderModalHTML()}
     ${orderDetailModalHTML()}
+    ${editOrderModalHTML()}
   `;
 
   document.getElementById('newOrderBtn').addEventListener('click', openNewOrder);
@@ -67,6 +68,7 @@ async function renderOrders() {
   document.getElementById('orderForm').addEventListener('submit', submitOrder);
   document.getElementById('waInput').addEventListener('blur', lookupCustomer);
   document.getElementById('itemSearchInput').addEventListener('input', e => drawStockItems(e.target.value));
+  document.getElementById('editOrderForm').addEventListener('submit', submitEditOrder);
 
   await loadOrders();
 }
@@ -106,7 +108,10 @@ async function loadOrders() {
         <td>${o.item_count} item(s)</td>
         <td>${formatQAR(o.total)}</td>
         <td><span class="badge text-bg-${st.color}">${st.label}</span></td>
-        <td><button class="btn btn-sm btn-outline-primary" onclick="openOrderDetail(${o.id})">👁 View</button></td>
+        <td class="d-flex gap-1 flex-wrap">
+          <button class="btn btn-sm btn-outline-primary" onclick="openOrderDetail(${o.id})">👁 View</button>
+          ${!['delivered','cancelled'].includes(o.status) ? `<button class="btn btn-sm btn-outline-secondary" onclick="openEditOrder(${o.id})">✏️ Edit</button>` : ''}
+        </td>
       </tr>`;
   }).join('');
 }
@@ -165,11 +170,11 @@ function orderModalHTML() {
               <div class="row g-2">
                 <div class="col-6">
                   <label class="form-label">Delivery Fee (QAR)</label>
-                  <input type="number" step="0.01" min="0" class="form-control" id="orderDelivery" value="0" />
+                  <input type="number" step="0.01" min="0" class="form-control" id="orderDelivery" value="0" oninput="drawSummary()" />
                 </div>
                 <div class="col-6">
                   <label class="form-label">Packaging Cost (QAR)</label>
-                  <input type="number" step="0.01" min="0" class="form-control" id="orderPackaging" value="0" />
+                  <input type="number" step="0.01" min="0" class="form-control" id="orderPackaging" value="0" oninput="drawSummary()" />
                 </div>
               </div>
               <div class="mb-2 mt-2">
@@ -432,6 +437,252 @@ async function updateOrderStatus(id) {
     });
     showToast('Status updated');
     bootstrap.Modal.getInstance(document.getElementById('orderDetailModal')).hide();
+    await loadOrders();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
+// ---- Edit order ----
+
+let editOrderId = null;
+let editOrderCart = [];   // [{item_id, name, sell_price, quantity, effectiveStock}]
+let editAllItems = [];    // all items from API
+
+function editOrderModalHTML() {
+  return `
+  <div class="modal fade" id="editOrderModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <form id="editOrderForm">
+          <div class="modal-header">
+            <h5 class="modal-title" id="editOrderTitle">Edit Order</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body">
+
+            <h6 class="fw-semibold text-muted mb-2">Customer</h6>
+            <div class="row g-2 mb-3">
+              <div class="col-12 col-md-4">
+                <label class="form-label">Name *</label>
+                <input type="text" class="form-control" id="editCustName" required />
+              </div>
+              <div class="col-12 col-md-4">
+                <label class="form-label">WhatsApp</label>
+                <input type="text" class="form-control" id="editCustWa" />
+              </div>
+              <div class="col-12 col-md-4">
+                <label class="form-label">Area</label>
+                <input type="text" class="form-control" id="editCustArea" />
+              </div>
+            </div>
+
+            <h6 class="fw-semibold text-muted mb-2">Items</h6>
+            <input type="text" class="form-control mb-2" id="editItemSearch" placeholder="Search to add items…" />
+            <div id="editStockList" style="max-height:150px;overflow:auto;" class="mb-2"></div>
+            <div id="editCartList"></div>
+            <div class="text-end fw-bold mt-1">Subtotal: <span id="editCartSubtotal">QAR 0.00</span></div>
+
+            <h6 class="fw-semibold text-muted mt-3 mb-2">Details</h6>
+            <div class="row g-2 mb-2">
+              <div class="col-12 col-md-4">
+                <label class="form-label">Source</label>
+                <select class="form-select" id="editOrderSource">
+                  ${Object.keys(SOURCE_META).map(s => `<option value="${s}">${SOURCE_META[s].icon} ${SOURCE_META[s].label}</option>`).join('')}
+                </select>
+              </div>
+              <div class="col-6 col-md-4">
+                <label class="form-label">Delivery Fee (QAR)</label>
+                <input type="number" step="0.01" min="0" class="form-control" id="editDelivery" value="0" oninput="drawEditSummary()" />
+              </div>
+              <div class="col-6 col-md-4">
+                <label class="form-label">Packaging Cost (QAR)</label>
+                <input type="number" step="0.01" min="0" class="form-control" id="editPackaging" value="0" oninput="drawEditSummary()" />
+              </div>
+            </div>
+            <div class="mb-2">
+              <label class="form-label">Notes</label>
+              <textarea class="form-control" id="editNotes" rows="2"></textarea>
+            </div>
+
+            <div class="card p-3 mt-2" style="background:var(--bg);">
+              <h6>Order Summary</h6>
+              <div id="editOrderSummary"></div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-primary">Save Changes</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function openEditOrder(id) {
+  let order;
+  try {
+    order = await apiFetch(`/api/orders/${id}`);
+  } catch (e) {
+    showToast('Failed to load order', 'error');
+    return;
+  }
+
+  if (['delivered', 'cancelled'].includes(order.status)) {
+    showToast('Cannot edit a delivered or cancelled order', 'error');
+    return;
+  }
+
+  editOrderId = id;
+
+  try {
+    editAllItems = await apiFetch('/api/items');
+  } catch (e) {
+    showToast('Failed to load items', 'error');
+    return;
+  }
+
+  // Build cart from order items; restore this order's deducted stock for each item
+  editOrderCart = order.items.map(oi => {
+    const item = editAllItems.find(i => i.id === oi.item_id);
+    return {
+      item_id: oi.item_id,
+      name: oi.item_name,
+      sell_price: oi.price_at_time,
+      quantity: oi.quantity,
+      effectiveStock: (item ? item.stock : 0) + oi.quantity,
+    };
+  });
+
+  document.getElementById('editOrderTitle').textContent = `Edit Order #${id}`;
+  document.getElementById('editCustName').value = order.customer_name || '';
+  document.getElementById('editCustWa').value = order.whatsapp || '';
+  document.getElementById('editCustArea').value = order.area || '';
+  document.getElementById('editOrderSource').value = order.source || 'whatsapp';
+  document.getElementById('editDelivery').value = order.delivery_fee || 0;
+  document.getElementById('editPackaging').value = order.packaging_cost || 0;
+  document.getElementById('editNotes').value = order.notes || '';
+
+  document.getElementById('editItemSearch').oninput = e => drawEditStockItems(e.target.value);
+
+  drawEditCart();
+  drawEditStockItems('');
+  drawEditSummary();
+
+  new bootstrap.Modal(document.getElementById('editOrderModal')).show();
+}
+
+function drawEditStockItems(filter) {
+  const f = (filter || '').toLowerCase();
+  const list = editAllItems.filter(i => {
+    if (!i.name.toLowerCase().includes(f)) return false;
+    const inCart = editOrderCart.find(c => c.item_id === i.id);
+    if (inCart) return inCart.quantity < inCart.effectiveStock;
+    return i.stock > 0;
+  });
+  const el = document.getElementById('editStockList');
+  if (!el) return;
+  el.innerHTML = list.length ? list.map(i => {
+    const inCart = editOrderCart.find(c => c.item_id === i.id);
+    const avail = inCart ? inCart.effectiveStock : i.stock;
+    return `
+      <div class="d-flex justify-content-between align-items-center py-1 border-bottom">
+        <span>${i.name} <small class="text-muted">(${formatQAR(i.sell_price)}, stock ${avail})</small></span>
+        <button type="button" class="btn btn-sm btn-outline-primary" onclick="addToEditCart(${i.id})">Add</button>
+      </div>`;
+  }).join('') : '<div class="text-muted py-2">No matching in-stock items.</div>';
+}
+
+function addToEditCart(itemId) {
+  const item = editAllItems.find(i => i.id === itemId);
+  if (!item) return;
+  const existing = editOrderCart.find(c => c.item_id === itemId);
+  if (existing) {
+    if (existing.quantity + 1 > existing.effectiveStock) { showToast('Not enough stock', 'error'); return; }
+    existing.quantity++;
+  } else {
+    if (item.stock <= 0) { showToast('Not enough stock', 'error'); return; }
+    editOrderCart.push({ item_id: item.id, name: item.name, sell_price: item.sell_price, quantity: 1, effectiveStock: item.stock });
+  }
+  drawEditCart();
+  drawEditSummary();
+  drawEditStockItems(document.getElementById('editItemSearch').value);
+}
+
+function changeEditQty(itemId, delta) {
+  const c = editOrderCart.find(x => x.item_id === itemId);
+  if (!c) return;
+  const next = c.quantity + delta;
+  if (next <= 0) { editOrderCart = editOrderCart.filter(x => x.item_id !== itemId); }
+  else if (next > c.effectiveStock) { showToast('Not enough stock', 'error'); return; }
+  else c.quantity = next;
+  drawEditCart();
+  drawEditSummary();
+  drawEditStockItems(document.getElementById('editItemSearch').value);
+}
+
+function editCartSubtotal() {
+  return editOrderCart.reduce((s, c) => s + c.sell_price * c.quantity, 0);
+}
+
+function drawEditCart() {
+  const el = document.getElementById('editCartList');
+  if (!el) return;
+  el.innerHTML = editOrderCart.length ? editOrderCart.map(c => `
+    <div class="d-flex justify-content-between align-items-center py-1">
+      <span>${c.name}</span>
+      <span class="d-flex align-items-center gap-2">
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="changeEditQty(${c.item_id}, -1)">−</button>
+        <span>${c.quantity}</span>
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="changeEditQty(${c.item_id}, 1)">+</button>
+        <span class="ms-2">${formatQAR(c.sell_price * c.quantity)}</span>
+      </span>
+    </div>`).join('') : '<div class="text-muted">No items.</div>';
+  const sub = document.getElementById('editCartSubtotal');
+  if (sub) sub.textContent = formatQAR(editCartSubtotal());
+}
+
+function drawEditSummary() {
+  const delivery = parseFloat(document.getElementById('editDelivery')?.value) || 0;
+  const packaging = parseFloat(document.getElementById('editPackaging')?.value) || 0;
+  const sub = editCartSubtotal();
+  const total = sub + delivery + packaging;
+  const el = document.getElementById('editOrderSummary');
+  if (!el) return;
+  el.innerHTML = `
+    ${editOrderCart.map(c => `<div class="d-flex justify-content-between"><span>${c.name} × ${c.quantity}</span><span>${formatQAR(c.sell_price * c.quantity)}</span></div>`).join('')}
+    <hr class="my-2"/>
+    <div class="d-flex justify-content-between"><span>Subtotal</span><span>${formatQAR(sub)}</span></div>
+    <div class="d-flex justify-content-between"><span>Delivery</span><span>${formatQAR(delivery)}</span></div>
+    <div class="d-flex justify-content-between"><span>Packaging</span><span>${formatQAR(packaging)}</span></div>
+    <div class="d-flex justify-content-between fw-bold mt-1" style="font-size:1.1rem;"><span>Total</span><span>${formatQAR(total)}</span></div>
+  `;
+}
+
+async function submitEditOrder(e) {
+  e.preventDefault();
+  if (!editOrderCart.length) { showToast('Order must have at least one item', 'error'); return; }
+  const payload = {
+    customer: {
+      name: document.getElementById('editCustName').value.trim(),
+      whatsapp: document.getElementById('editCustWa').value.trim(),
+      area: document.getElementById('editCustArea').value.trim(),
+    },
+    items: editOrderCart.map(c => ({ item_id: c.item_id, quantity: c.quantity })),
+    source: document.getElementById('editOrderSource').value,
+    delivery_fee: parseFloat(document.getElementById('editDelivery').value) || 0,
+    packaging_cost: parseFloat(document.getElementById('editPackaging').value) || 0,
+    notes: document.getElementById('editNotes').value.trim(),
+  };
+  try {
+    await apiFetch(`/api/orders/${editOrderId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    bootstrap.Modal.getInstance(document.getElementById('editOrderModal')).hide();
+    showToast('Order updated!');
     await loadOrders();
   } catch (err) {
     showToast(err.message, 'error');

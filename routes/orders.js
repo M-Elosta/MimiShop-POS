@@ -96,6 +96,74 @@ router.post('/', (req, res) => {
   }
 });
 
+router.patch('/:id', (req, res) => {
+  try {
+    const order = db.prepare(`
+      SELECT o.*, c.name as cust_name, c.whatsapp, c.area
+      FROM orders o LEFT JOIN customers c ON o.customer_id = c.id
+      WHERE o.id = ?
+    `).get(req.params.id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (['delivered', 'cancelled'].includes(order.status)) {
+      return res.status(400).json({ error: 'Cannot edit a delivered or cancelled order' });
+    }
+
+    const { customer, items, delivery_fee, packaging_cost, source, notes } = req.body;
+
+    if (items !== undefined && !items.length) {
+      return res.status(400).json({ error: 'Order must have at least one item' });
+    }
+
+    const existingItems = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(req.params.id);
+
+    if (items) {
+      for (const oi of items) {
+        const item = db.prepare('SELECT * FROM items WHERE id = ?').get(oi.item_id);
+        if (!item) return res.status(400).json({ error: `Item ${oi.item_id} not found` });
+        const oldQty = (existingItems.find(e => e.item_id === oi.item_id) || {}).quantity || 0;
+        if (item.stock + oldQty < oi.quantity) {
+          return res.status(400).json({ error: `Insufficient stock for "${item.name}". Available: ${item.stock + oldQty}` });
+        }
+      }
+    }
+
+    const updateOrder = db.transaction(() => {
+      if (customer && order.customer_id) {
+        db.prepare('UPDATE customers SET name=?, whatsapp=?, area=? WHERE id=?').run(
+          customer.name, customer.whatsapp || null, customer.area || null, order.customer_id
+        );
+      }
+      db.prepare(
+        'UPDATE orders SET source=?, delivery_fee=?, packaging_cost=?, notes=? WHERE id=?'
+      ).run(
+        source !== undefined ? source : order.source,
+        delivery_fee !== undefined ? parseFloat(delivery_fee) || 0 : order.delivery_fee,
+        packaging_cost !== undefined ? parseFloat(packaging_cost) || 0 : order.packaging_cost,
+        notes !== undefined ? (notes || null) : order.notes,
+        req.params.id
+      );
+      if (items) {
+        for (const oi of existingItems) {
+          db.prepare('UPDATE items SET stock = stock + ? WHERE id = ?').run(oi.quantity, oi.item_id);
+        }
+        db.prepare('DELETE FROM order_items WHERE order_id = ?').run(req.params.id);
+        for (const oi of items) {
+          const item = db.prepare('SELECT * FROM items WHERE id = ?').get(oi.item_id);
+          db.prepare(
+            'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)'
+          ).run(req.params.id, oi.item_id, oi.quantity, item.sell_price);
+          db.prepare('UPDATE items SET stock = stock - ? WHERE id = ?').run(oi.quantity, oi.item_id);
+        }
+      }
+    });
+
+    updateOrder();
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.patch('/:id/status', (req, res) => {
   try {
     const { status } = req.body;
