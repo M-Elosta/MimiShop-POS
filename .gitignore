@@ -1,0 +1,6 @@
+node_modules/
+shop.db
+shop.db-shm
+shop.db-wal
+public/uploads/*
+!public/uploads/.gitkeep
